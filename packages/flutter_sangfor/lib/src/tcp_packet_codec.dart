@@ -18,6 +18,13 @@ const int tcpFlagAck = 0x10;
 /// TCP option kind for the maximum segment size (RFC 6691).
 const int tcpOptionMss = 2;
 
+/// TCP option kind for the window scale shift (RFC 7323).
+const int tcpOptionWindowScale = 3;
+
+/// Largest legal window scale shift. The header field is a single byte, but
+/// the RFC caps the shift at 14 so the scaled window fits in 30 bits.
+const int tcpMaximumWindowScale = 14;
+
 /// A parsed IPv4/TCP packet. The view borrows the underlying buffer; the
 /// payload is a sublist view, so callers must not mutate it.
 class SangforTcpSegment {
@@ -80,29 +87,45 @@ class SangforTcpSegment {
 
   bool get isRst => flags & tcpFlagRst != 0;
 
-  /// The receive window the sender advertises, without scaling.
+  /// The receive window field as it appears on the wire. Multiply by
+  /// `1 << windowScale` when scaling was negotiated and the segment is not a
+  /// SYN: RFC 7323 keeps the window field of a SYN (and SYN-ACK) unscaled.
   int get window => _uint16(packet, _tcpOffset + 14);
 
   /// The MSS option the sender offered, or 0 when it did not send one.
-  int get maximumSegmentSize {
+  int get maximumSegmentSize => _optionValue(tcpOptionMss, 2) ?? 0;
+
+  /// The window scale shift the sender offered, or null when it sent no window
+  /// scale option.
+  ///
+  /// Only a handshake carries it, and only a handshake decides whether scaling
+  /// applies: a connection uses scaling only when both sides offered it.
+  int? get windowScale => _optionValue(tcpOptionWindowScale, 1);
+
+  /// The first option with [kind], or null. [valueLength] is the width of the
+  /// value inside the option; an option of any other length is ignored.
+  int? _optionValue(int kind, int valueLength) {
     final end = _tcpOffset + _dataOffset;
     var index = _tcpOffset + tcpHeaderLength;
     while (index < end) {
-      final kind = packet[index];
-      if (kind == 0) break;
-      if (kind == 1) {
+      final optionKind = packet[index];
+      if (optionKind == 0) break;
+      if (optionKind == 1) {
         index++;
         continue;
       }
       if (index + 1 >= end) break;
       final length = packet[index + 1];
       if (length < 2 || index + length > end) break;
-      if (kind == tcpOptionMss && length == 4) {
-        return _uint16(packet, index + 2);
+      if (optionKind == kind) {
+        if (length != valueLength + 2) return null;
+        return valueLength == 1
+            ? packet[index + 2]
+            : _uint16(packet, index + 2);
       }
       index += length;
     }
-    return 0;
+    return null;
   }
 
   /// The TCP payload, empty for bare control segments.
@@ -155,7 +178,10 @@ class SangforTcpPacketBuilder {
   static final Uint8List _emptyPayload = Uint8List(0);
 
   /// Assembles one IPv4/TCP packet. [mss] adds an MSS option to the TCP
-  /// header, which is what a SYN-ACK needs to clamp the peer's segments.
+  /// header, which is what a SYN-ACK needs to clamp the peer's segments;
+  /// [windowScale] adds a window scale option (RFC 7323), which is what a
+  /// SYN-ACK needs before it can advertise a window wider than the 64 KB the
+  /// bare header field holds. Both belong in a handshake segment only.
   Uint8List build({
     required String sourceAddress,
     required String destinationAddress,
@@ -167,9 +193,15 @@ class SangforTcpPacketBuilder {
     required int window,
     Uint8List? payload,
     int? mss,
+    int? windowScale,
     int identification = 0,
     int timeToLive = 64,
   }) {
+    assert(
+      windowScale == null ||
+          (windowScale >= 0 && windowScale <= tcpMaximumWindowScale),
+      'window scale shift must be within 0..$tcpMaximumWindowScale',
+    );
     final source = parseIPv4Address(sourceAddress);
     final destination = parseIPv4Address(destinationAddress);
     if (source.length != 4 || destination.length != 4) {
@@ -179,7 +211,8 @@ class SangforTcpPacketBuilder {
         'both endpoints must be dotted-quad IPv4 addresses',
       );
     }
-    final optionLength = mss == null ? 0 : 4;
+    final options = _options(mss: mss, windowScale: windowScale);
+    final optionLength = options.length;
     final body = payload ?? _emptyPayload;
     final tcpLength = tcpHeaderLength + optionLength + body.length;
     final packet = Uint8List(ipv4HeaderLength + tcpLength);
@@ -207,10 +240,9 @@ class SangforTcpPacketBuilder {
     packet[tcp + 12] = ((tcpHeaderLength + optionLength) ~/ 4) << 4;
     packet[tcp + 13] = flags & 0xff;
     data.setUint16(tcp + 14, window & 0xffff, Endian.big);
-    if (mss != null) {
-      packet[tcp + tcpHeaderLength] = tcpOptionMss;
-      packet[tcp + tcpHeaderLength + 1] = 4;
-      data.setUint16(tcp + tcpHeaderLength + 2, mss & 0xffff, Endian.big);
+    if (optionLength > 0) {
+      packet.setRange(
+          tcp + tcpHeaderLength, tcp + tcpHeaderLength + optionLength, options);
     }
     if (body.isNotEmpty) {
       packet.setRange(
@@ -225,6 +257,22 @@ class SangforTcpPacketBuilder {
       Endian.big,
     );
     return packet;
+  }
+
+  /// Builds the option list: MSS, then window scale, padded with NOPs to a
+  /// multiple of four so the header stays 32-bit aligned.
+  static Uint8List _options({int? mss, int? windowScale}) {
+    final options = <int>[];
+    if (mss != null) {
+      options.addAll(<int>[tcpOptionMss, 4, (mss >> 8) & 0xff, mss & 0xff]);
+    }
+    if (windowScale != null) {
+      options.addAll(<int>[tcpOptionWindowScale, 3, windowScale & 0xff]);
+    }
+    while (options.isNotEmpty && options.length % 4 != 0) {
+      options.add(1);
+    }
+    return Uint8List.fromList(options);
   }
 }
 

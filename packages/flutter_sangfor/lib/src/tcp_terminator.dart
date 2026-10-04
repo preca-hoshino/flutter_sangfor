@@ -23,6 +23,19 @@ typedef SangforTcpTerminationFilter = bool Function(
 typedef SangforTcpDialHostResolver = String? Function(
     String destinationAddress, int destinationPort);
 
+/// Receive window a terminated connection advertises when window scaling is
+/// off: the largest value the bare 16-bit header field holds. A connection
+/// capped here keeps at most 64 KB in flight.
+const int sangforTcpUnscaledWindow = 65535;
+
+/// The window scale shift offered when scaling is on (RFC 7323).
+const int sangforTcpWindowScaleShift = 7;
+
+/// Receive window a terminated connection advertises when scaling is on:
+/// 1 MiB, comfortably inside what [sangforTcpWindowScaleShift] can express
+/// (`65535 << 7` is about 8 MB).
+const int sangforTcpScaledWindow = 1024 * 1024;
+
 /// Terminates TCP connections that arrive as raw IP packets and relays their
 /// payload through a byte-stream dialer (RFC 793, server role).
 ///
@@ -32,17 +45,19 @@ typedef SangforTcpDialHostResolver = String? Function(
 /// copies bytes in both directions. Only the client-facing side is synthesized;
 /// the upstream side is a plain [SangforTcpStream].
 ///
-/// Deliberately minimal: no window scaling, no SACK, no timestamps, and
-/// out-of-order segments are answered with a duplicate ACK so the peer
-/// retransmits. That covers HTTP-shaped traffic and keeps the state machine
-/// small enough to audit.
+/// Deliberately minimal: no SACK, no timestamps, and out-of-order segments are
+/// answered with a duplicate ACK so the peer retransmits. Window scaling is
+/// negotiable ([windowScale]) because the 64 KB the bare header field holds
+/// caps a connection's throughput. That covers HTTP-shaped traffic and keeps
+/// the state machine small enough to audit.
 class SangforTcpTerminator {
   SangforTcpTerminator({
     required SangforTcpDialer dialer,
     required SangforTcpTerminationFilter shouldTerminate,
     SangforTcpDialHostResolver? dialHostResolver,
     this.maximumSegmentSize = 1400,
-    this.advertisedWindow = 65535,
+    this.advertisedWindow = sangforTcpScaledWindow,
+    this.windowScale = sangforTcpWindowScaleShift,
     this.dialTimeout = const Duration(seconds: 20),
     this.idleTimeout = const Duration(minutes: 5),
     this.initialRetransmitTimeout = const Duration(milliseconds: 300),
@@ -53,7 +68,17 @@ class SangforTcpTerminator {
     Random? random,
     void Function(Object error)? onError,
   })  : assert(maximumSegmentSize > 0 && maximumSegmentSize <= 65495),
-        assert(advertisedWindow > 0 && advertisedWindow <= 65535),
+        assert(advertisedWindow > 0),
+        assert(windowScale >= 0 && windowScale <= tcpMaximumWindowScale),
+        // Without window scaling the header field is the whole window, so the
+        // value has to fit in 16 bits and the shift must not round it down to
+        // zero -- a zero window stalls the connection outright.
+        assert(
+          windowScale > 0
+              ? advertisedWindow >> windowScale > 0 &&
+                  advertisedWindow <= (65535 << windowScale)
+              : advertisedWindow <= 65535,
+        ),
         assert(resumeUpstreamAt < pauseUpstreamAt),
         _dialer = dialer,
         _shouldTerminate = shouldTerminate,
@@ -68,9 +93,23 @@ class SangforTcpTerminator {
   /// in its SYN clamps it further.
   final int maximumSegmentSize;
 
-  /// Receive window advertised to the local stack. Without window scaling this
-  /// also caps a single connection's throughput.
+  /// Receive window advertised to the local stack: it bounds how many bytes of
+  /// a terminated connection may be in flight towards the local stack at once,
+  /// which is how fast that connection can drain. Above 65535 it needs
+  /// [windowScale], because the bare header field cannot hold more; a peer that
+  /// does not offer scaling falls back to the 64 KB field the RFC allows there.
   final int advertisedWindow;
+
+  /// Window scale shift offered in the SYN-ACK (RFC 7323).
+  ///
+  /// Scaling only takes effect when the peer offered the option too, so sending
+  /// it is free: without the peer's option the connection uses the bare 16-bit
+  /// field exactly as before. It is on by default because 64 KB is all a
+  /// terminated connection can keep in flight otherwise, which caps its
+  /// throughput at `64 KB / round trip` -- and this round trip runs through the
+  /// app's own event loop (two isolate hops, an observer, a write into the
+  /// packet device), so it stretches out exactly when the app is busy.
+  final int windowScale;
 
   final Duration dialTimeout;
   final Duration idleTimeout;
@@ -284,6 +323,8 @@ class _TerminatedConnection {
   int _sendNext = 0;
   int _sendUnacknowledged = 0;
   int _peerWindow = 0;
+  int _peerWindowScale = 0;
+  bool _scaling = false;
   int _maximumSegmentSize = 1400;
   bool _handshakeComplete = false;
   bool _upstreamDone = false;
@@ -302,7 +343,16 @@ class _TerminatedConnection {
     _ourInitialSequence = _terminator._random.nextInt(0x7fffffff);
     _sendNext = tcpSequenceAdd(_ourInitialSequence, 1);
     _sendUnacknowledged = _ourInitialSequence;
+    // RFC 7323: the window field of the SYN itself is never scaled, so this is
+    // the peer's real byte count.
     _peerWindow = syn.window;
+    final peerScale = syn.windowScale;
+    if (_terminator.windowScale > 0 &&
+        peerScale != null &&
+        peerScale <= tcpMaximumWindowScale) {
+      _scaling = true;
+      _peerWindowScale = peerScale;
+    }
     final offeredMss = syn.maximumSegmentSize;
     _maximumSegmentSize = offeredMss == 0
         ? _terminator.maximumSegmentSize
@@ -329,7 +379,7 @@ class _TerminatedConnection {
       unawaited(_dispose(reset: false));
       return;
     }
-    _peerWindow = segment.window;
+    _peerWindow = _scalePeerWindow(segment);
     if (segment.isAck) {
       _acknowledge(segment.acknowledgmentNumber);
     }
@@ -522,11 +572,32 @@ class _TerminatedConnection {
         sequenceNumber: _sendNext,
         acknowledgmentNumber: _receiveNext,
         flags: tcpFlagAck,
-        window: _terminator.advertisedWindow,
+        window: _windowField,
         identification: _terminator._nextIdentification(),
       ),
     );
   }
+
+  /// The window field for a segment that is not a SYN. With scaling negotiated
+  /// it carries the scaled value, which is what lets the peer keep megabytes
+  /// in flight.
+  int get _windowField => _scaling
+      ? _terminator.advertisedWindow >> _terminator.windowScale
+      : _unscaledWindow;
+
+  /// The window field as it appears before scaling is agreed to. RFC 7323
+  /// leaves the SYN's and SYN-ACK's own field unscaled, and the 16-bit field
+  /// cannot hold more than this anyway.
+  int get _unscaledWindow {
+    final window = _terminator.advertisedWindow;
+    return window > 65535 ? 65535 : window;
+  }
+
+  /// The peer's window field brought back to bytes. Scaling applies only to
+  /// segments after the SYN, whose field is always literal.
+  int _scalePeerWindow(SangforTcpSegment segment) => _scaling && !segment.isSyn
+      ? segment.window << _peerWindowScale
+      : segment.window;
 
   void _transmit({
     required int flags,
@@ -536,6 +607,7 @@ class _TerminatedConnection {
     int? sequenceOverride,
   }) {
     final sequence = sequenceOverride ?? _sendNext;
+    final isSyn = flags & tcpFlagSyn != 0;
     final packet = _terminator._builder.build(
       sourceAddress: serverAddress,
       destinationAddress: clientAddress,
@@ -544,9 +616,10 @@ class _TerminatedConnection {
       sequenceNumber: sequence,
       acknowledgmentNumber: _receiveNext,
       flags: flags,
-      window: _terminator.advertisedWindow,
+      window: isSyn ? _unscaledWindow : _windowField,
       payload: payload,
       mss: mss,
+      windowScale: isSyn && _scaling ? _terminator.windowScale : null,
       identification: _terminator._nextIdentification(),
     );
     if (sequenceOverride == null) {

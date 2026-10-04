@@ -92,6 +92,8 @@ class _Harness {
     Duration retransmitTimeout = const Duration(milliseconds: 40),
     int maximumSegmentSize = 1400,
     int maximumRetransmits = 8,
+    int advertisedWindow = 1024 * 1024,
+    int windowScale = 7,
   }) {
     terminator = SangforTcpTerminator(
       dialer: (String host, int port) async {
@@ -109,6 +111,8 @@ class _Harness {
           filter ?? (String host, int port) => host == _serverAddress,
       dialHostResolver: hostResolver,
       maximumSegmentSize: maximumSegmentSize,
+      advertisedWindow: advertisedWindow,
+      windowScale: windowScale,
       initialRetransmitTimeout: retransmitTimeout,
       maximumRetransmits: maximumRetransmits,
       onError: (Object error) => errors.add(error),
@@ -156,6 +160,7 @@ Uint8List clientPacket({
   List<int> payload = const <int>[],
   int window = 65535,
   int? mss,
+  int? windowScale,
 }) =>
     const SangforTcpPacketBuilder().build(
       sourceAddress: _clientAddress,
@@ -168,6 +173,7 @@ Uint8List clientPacket({
       window: window,
       payload: Uint8List.fromList(payload),
       mss: mss,
+      windowScale: windowScale,
     );
 
 final Uint8List udpPacket = Uint8List.fromList(<int>[
@@ -181,6 +187,7 @@ Future<SangforTcpSegment> _acceptSyn(
   _Harness harness, {
   int window = 65535,
   int? mss,
+  int? windowScale,
 }) async {
   harness.terminator.accept(
     clientPacket(
@@ -189,6 +196,7 @@ Future<SangforTcpSegment> _acceptSyn(
       flags: tcpFlagSyn,
       window: window,
       mss: mss ?? 1460,
+      windowScale: windowScale,
     ),
   );
   await pumpEventQueue();
@@ -317,6 +325,36 @@ void main() {
         1, 1, 2, 4, 0x05, 0xb4, 0, 0, // NOP, NOP, MSS=1460, padding
       ]);
       expect(SangforTcpSegment.parse(packet)?.maximumSegmentSize, 1460);
+    });
+
+    test('round-trips the MSS and window scale options together', () {
+      final packet = const SangforTcpPacketBuilder().build(
+        sourceAddress: _serverAddress,
+        destinationAddress: _clientAddress,
+        sourcePort: _serverPort,
+        destinationPort: _clientPort,
+        sequenceNumber: 1,
+        acknowledgmentNumber: 1,
+        flags: tcpFlagSyn | tcpFlagAck,
+        window: 65535,
+        mss: 1380,
+        windowScale: 7,
+      );
+      final segment = SangforTcpSegment.parse(packet)!;
+      expect(segment.maximumSegmentSize, 1380);
+      expect(segment.windowScale, 7);
+      // Seven value bytes plus one NOP keeps the header 32-bit aligned.
+      expect((packet[32] >> 4) * 4, 28);
+    });
+
+    test('reports no window scale when the option is absent', () {
+      final packet = clientPacket(
+        sequence: 1,
+        acknowledgment: 1,
+        flags: tcpFlagSyn,
+        mss: 1460,
+      );
+      expect(SangforTcpSegment.parse(packet)?.windowScale, isNull);
     });
   });
 
@@ -465,6 +503,75 @@ void main() {
       );
       expect(delivered, 250);
       expect(harness.dataSegments, hasLength(2));
+    });
+
+    test('negotiates window scaling and lifts the in-flight window', () async {
+      final harness = _Harness().start();
+      addTearDown(harness.dispose);
+      final synAck = await _acceptSyn(harness, window: 512, windowScale: 7);
+      // The SYN-ACK offers the shift its own way, and keeps its window field
+      // unscaled: RFC 7323 scales nothing inside a handshake segment.
+      expect(synAck.windowScale, 7);
+      expect(synAck.window, 65535);
+      harness.terminator.accept(
+        clientPacket(
+          sequence: 1001,
+          acknowledgment: synAck.sequenceNumber + 1,
+          flags: tcpFlagAck,
+          window: 512,
+        ),
+      );
+      await pumpEventQueue();
+      harness.upstream.deliver(List<int>.filled(200000, 7));
+      await pumpEventQueue();
+      final delivered = harness.dataSegments.fold<int>(
+        0,
+        (sum, segment) => sum + segment.payload.length,
+      );
+      // `512 << 7` is 65536, so the peer's window no longer caps the flow at
+      // the 512 bytes the bare field would have meant.
+      expect(delivered, 65536);
+      // And this side's own window goes out scaled down by the same shift.
+      expect(harness.dataSegments.first.window, 1024 * 1024 >> 7);
+    });
+
+    test('keeps the bare window when the peer offers no scaling', () async {
+      final harness = _Harness().start();
+      addTearDown(harness.dispose);
+      final synAck = await _acceptSyn(harness, window: 512);
+      expect(synAck.windowScale, isNull);
+      // The configured window is 1 MB, but without scaling only the 16-bit
+      // field is available, so it clamps instead of wrapping to zero.
+      expect(synAck.window, 65535);
+      harness.terminator.accept(
+        clientPacket(
+          sequence: 1001,
+          acknowledgment: synAck.sequenceNumber + 1,
+          flags: tcpFlagAck,
+          window: 512,
+        ),
+      );
+      await pumpEventQueue();
+      harness.upstream.deliver(List<int>.filled(200000, 7));
+      await pumpEventQueue();
+      final delivered = harness.dataSegments.fold<int>(
+        0,
+        (sum, segment) => sum + segment.payload.length,
+      );
+      expect(delivered, 512);
+      expect(harness.dataSegments.first.window, 65535);
+    });
+
+    test('rejects a window the header field cannot hold', () {
+      expect(
+        () => SangforTcpTerminator(
+          dialer: (String host, int port) async => FakeUpstream(),
+          shouldTerminate: (String host, int port) => true,
+          advertisedWindow: 128 * 1024,
+          windowScale: 0,
+        ),
+        throwsA(isA<AssertionError>()),
+      );
     });
 
     test('segments a large response at the MSS', () async {
