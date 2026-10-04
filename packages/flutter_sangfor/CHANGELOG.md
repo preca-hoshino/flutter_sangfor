@@ -1,3 +1,24 @@
+## Unreleased
+
+* `SangforTcpTerminator` negotiates TCP window scaling (RFC 7323) and
+  advertises a 1 MiB window by default instead of the 64 KB the bare header
+  field holds. One terminated connection used to keep at most 64 KB in flight,
+  which capped its throughput at `64 KB / round trip` -- and that round trip
+  runs through the host's own event loop, so it stretched out exactly when the
+  host was busy. A peer that does not offer the option falls back to the
+  unscaled 16-bit field, so the default is safe to send.
+* The two settings are named once, as `sangforTcpScaledWindow` /
+  `sangforTcpUnscaledWindow` / `sangforTcpWindowScaleShift`, so a host that
+  exposes the choice (ShuVPN's experimental page) writes the same numbers the
+  constructor defaults use. Turning scaling off means passing the unscaled
+  pair, which is byte-for-byte the old behaviour.
+* `SangforTcpPacketBuilder.build` takes a `windowScale` option and
+  `SangforTcpSegment` parses it. Both options are padded to a 32-bit boundary.
+* The iOS terminator (`ATrustTcpTerminator`) mirrors this: its `Configuration`
+  carries the same `advertisedWindow` / `windowScale` pair and negotiates the
+  option the same way, so the two data planes do not diverge. The Swift packet
+  codec gains a `windowScale` parameter and `ATrustTcpSegmentHeader.windowScale`.
+
 ## 0.0.12
 
 * `VpnTunnelService` overrides `onRevoke()` and reports it to Dart as
