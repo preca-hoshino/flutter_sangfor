@@ -17,6 +17,17 @@ public enum ATrustTcpFlag {
   public static let ack: UInt8 = 0x10
 }
 
+/// TCP option kinds and limits the terminator honours (RFC 6691, RFC 7323).
+public enum ATrustTcpOption {
+  /// Maximum segment size.
+  public static let mss = 2
+  /// Window scale shift.
+  public static let windowScale = 3
+  /// Largest legal shift. The header field is a single byte, but the RFC caps
+  /// the shift at 14 so the scaled window fits in 30 bits.
+  public static let maximumWindowScale = 14
+}
+
 /// A parsed IPv4 packet. The bytes are copied out on construction so the view
 /// stays valid regardless of who owns the buffer.
 public struct ATrustIPv4Packet {
@@ -74,24 +85,40 @@ public struct ATrustTcpSegmentHeader {
 
   /// The MSS option the sender offered, or 0 when absent.
   public var maximumSegmentSize: Int {
+    optionValue(ATrustTcpOption.mss, valueLength: 2) ?? 0
+  }
+
+  /// The window scale shift the sender offered, or nil when absent.
+  ///
+  /// Only a handshake carries it, and only a handshake decides whether scaling
+  /// applies: a connection uses scaling only when both sides offered it.
+  public var windowScale: Int? {
+    optionValue(ATrustTcpOption.windowScale, valueLength: 1)
+  }
+
+  /// The first option of [kind], or nil. [valueLength] is the width of the
+  /// value inside the option; an option of any other length is ignored.
+  private func optionValue(_ kind: Int, valueLength: Int) -> Int? {
     let end = min(dataOffset, bytes.count)
     var index = 20
     while index < end {
-      let kind = bytes[index]
-      if kind == 0 { break }
-      if kind == 1 {
+      let optionKind = bytes[index]
+      if optionKind == 0 { break }
+      if optionKind == 1 {
         index += 1
         continue
       }
       guard index + 1 < end else { break }
       let length = Int(bytes[index + 1])
       guard length >= 2, index + length <= end else { break }
-      if kind == 2, length == 4 {
+      if optionKind == kind {
+        guard length == valueLength + 2 else { return nil }
+        if valueLength == 1 { return Int(bytes[index + 2]) }
         return Int(bytes[index + 2]) << 8 | Int(bytes[index + 3])
       }
       index += length
     }
-    return 0
+    return nil
   }
 }
 
@@ -179,7 +206,10 @@ public func buildPacketMeta(_ packet: Data) -> ATrustPacketMeta? {
 /// is computed completely instead of relying on offload.
 public enum ATrustPacketCodec {
   /// Builds one IPv4/TCP packet. [mss] adds the MSS option, which is what a
-  /// SYN-ACK needs to clamp the peer.
+  /// SYN-ACK needs to clamp the peer's segments; [windowScale] adds a window
+  /// scale option (RFC 7323), which is what a SYN-ACK needs before it can
+  /// advertise a window wider than the 64 KB the bare header field holds. Both
+  /// belong in a handshake segment only.
   public static func buildTcp(
     sourceAddress: String,
     destinationAddress: String,
@@ -191,6 +221,7 @@ public enum ATrustPacketCodec {
     window: Int,
     payload: [UInt8] = [],
     mss: Int? = nil,
+    windowScale: Int? = nil,
     identification: Int = 0,
     timeToLive: Int = 64
   ) throws -> Data {
@@ -202,7 +233,8 @@ public enum ATrustPacketCodec {
         "endpoints \(sourceAddress) -> \(destinationAddress)"
       )
     }
-    let optionLength = mss == nil ? 0 : 4
+    let options = optionBytes(mss: mss, windowScale: windowScale)
+    let optionLength = options.count
     let tcpLength = 20 + optionLength + payload.count
     var packet = [UInt8](repeating: 0, count: 20 + tcpLength)
 
@@ -236,13 +268,16 @@ public enum ATrustPacketCodec {
     packet[tcp + 11] = UInt8(truncatingIfNeeded: UInt32(acknowledgmentNumber))
     packet[tcp + 12] = UInt8(((20 + optionLength) / 4) << 4)
     packet[tcp + 13] = flags
-    packet[tcp + 14] = UInt8(window >> 8)
-    packet[tcp + 15] = UInt8(window & 0xff)
-    if let mss {
-      packet[tcp + 20] = 2
-      packet[tcp + 21] = 4
-      packet[tcp + 22] = UInt8(mss >> 8)
-      packet[tcp + 23] = UInt8(mss & 0xff)
+    // The field is 16 bits: clamping keeps a mis-sized window from trapping,
+    // and the terminator clamps before it gets here anyway.
+    let windowField = min(max(window, 0), 0xffff)
+    packet[tcp + 14] = UInt8(windowField >> 8)
+    packet[tcp + 15] = UInt8(windowField & 0xff)
+    if !options.isEmpty {
+      packet.replaceSubrange(
+        (tcp + 20)..<(tcp + 20 + optionLength),
+        with: options
+      )
     }
     if !payload.isEmpty {
       packet.replaceSubrange(
@@ -254,6 +289,26 @@ public enum ATrustPacketCodec {
     packet[tcp + 16] = UInt8(tcpChecksumValue >> 8)
     packet[tcp + 17] = UInt8(tcpChecksumValue & 0xff)
     return Data(packet)
+  }
+
+  /// Builds the option list: MSS, then window scale, padded with NOPs to a
+  /// multiple of four so the header stays 32-bit aligned.
+  private static func optionBytes(mss: Int?, windowScale: Int?) -> [UInt8] {
+    var options: [UInt8] = []
+    if let mss {
+      options.append(contentsOf: [
+        UInt8(ATrustTcpOption.mss), 4, UInt8(mss >> 8), UInt8(mss & 0xff),
+      ])
+    }
+    if let windowScale {
+      options.append(contentsOf: [
+        UInt8(ATrustTcpOption.windowScale), 3, UInt8(windowScale & 0xff),
+      ])
+    }
+    while !options.isEmpty, options.count % 4 != 0 {
+      options.append(1)
+    }
+    return options
   }
 
   /// The ones'-complement checksum of an IPv4 header (checksum field zero).

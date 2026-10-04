@@ -681,6 +681,7 @@ func clientPacket(
   payload: [UInt8] = [],
   window: Int = 65535,
   mss: Int? = 1460,
+  windowScale: Int? = nil,
   source: String = "10.0.0.42",
   destination: String = "10.9.1.2",
   sourcePort: Int = 51000,
@@ -696,7 +697,8 @@ func clientPacket(
     flags: flags,
     window: window,
     payload: payload,
-    mss: mss
+    mss: mss,
+    windowScale: windowScale
   )
 }
 
@@ -961,6 +963,113 @@ do {
       )
     ),
     "a data packet for an unknown flow is not claimed"
+  )
+}
+
+// Window scaling (RFC 7323): the terminator offers the option and, when the
+// peer offers it too, the receive window stops being capped at the 64 KB the
+// bare header field holds.
+do {
+  let scheduler = VirtualScheduler()
+  var relay: FakeRelayStream?
+  let terminator = ATrustTcpTerminator(
+    dialer: { _, _, completion in
+      let stream = FakeRelayStream()
+      relay = stream
+      completion(.success(stream))
+    },
+    shouldTerminate: { _, _ in true },
+    scheduler: scheduler
+  )
+  var emitted: [Data] = []
+  terminator.onPacket = { emitted.append($0) }
+
+  _ = try terminator.accept(
+    clientPacket(
+      sequence: 1000,
+      acknowledgment: 0,
+      flags: ATrustTcpFlag.syn,
+      window: 512,
+      windowScale: 7
+    )
+  )
+  let synAck = segments(emitted).first
+  checkEqual(synAck?.windowScale, 7, "the SYN-ACK offers window scaling")
+  // RFC 7323 scales nothing inside a handshake segment.
+  checkEqual(synAck?.window, 65535, "the SYN-ACK window is unscaled")
+
+  _ = try terminator.accept(
+    clientPacket(
+      sequence: 1001,
+      acknowledgment: (synAck?.sequenceNumber ?? 0) + 1,
+      flags: ATrustTcpFlag.ack,
+      window: 512,
+      mss: nil
+    )
+  )
+  emitted.removeAll()
+  relay?.deliver([UInt8](repeating: 7, count: 4000))
+  let delivered = segments(emitted).reduce(0) { $0 + $1.payload.count }
+  // `512 << 7` is 65536, so the peer's window no longer caps the flow at the
+  // 512 bytes the bare field would have meant.
+  checkEqual(delivered, 4000, "the peer's scaled window lets the flow drain")
+  checkEqual(
+    segments(emitted).first?.window,
+    1024 * 1024 >> 7,
+    "our own window goes out scaled down by the same shift"
+  )
+}
+
+// Without the option the connection keeps the bare 16-bit field, which is the
+// pre-7323 behaviour exactly.
+do {
+  var configuration = ATrustTcpTerminator.Configuration()
+  configuration.windowScale = 0
+  let scheduler = VirtualScheduler()
+  var relay: FakeRelayStream?
+  let terminator = ATrustTcpTerminator(
+    dialer: { _, _, completion in
+      let stream = FakeRelayStream()
+      relay = stream
+      completion(.success(stream))
+    },
+    shouldTerminate: { _, _ in true },
+    scheduler: scheduler,
+    configuration: configuration
+  )
+  var emitted: [Data] = []
+  terminator.onPacket = { emitted.append($0) }
+
+  _ = try terminator.accept(
+    clientPacket(
+      sequence: 1000,
+      acknowledgment: 0,
+      flags: ATrustTcpFlag.syn,
+      window: 512,
+      windowScale: 7
+    )
+  )
+  let synAck = segments(emitted).first
+  checkEqual(synAck?.windowScale, nil, "scaling is not offered when disabled")
+  checkEqual(synAck?.window, 65535, "the window clamps to the 16-bit field")
+
+  _ = try terminator.accept(
+    clientPacket(
+      sequence: 1001,
+      acknowledgment: (synAck?.sequenceNumber ?? 0) + 1,
+      flags: ATrustTcpFlag.ack,
+      window: 512,
+      mss: nil
+    )
+  )
+  emitted.removeAll()
+  relay?.deliver([UInt8](repeating: 7, count: 4000))
+  let delivered = segments(emitted).reduce(0) { $0 + $1.payload.count }
+  checkEqual(delivered, 512, "the peer's window field is read literally")
+  checkEqual(
+    segments(emitted).first?.window,
+    65535,
+    "the advertised window is clamped to the field"
   )
 }
 

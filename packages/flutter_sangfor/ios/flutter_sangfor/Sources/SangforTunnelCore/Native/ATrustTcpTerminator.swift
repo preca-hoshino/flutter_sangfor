@@ -21,13 +21,30 @@ public protocol SangforRelayStream: AnyObject {
 /// terminator completes the handshake locally, dials the real destination
 /// through the tunnel, and copies bytes in both directions.
 ///
-/// Deliberately minimal, like the Dart reference: no window scaling, no SACK,
-/// no timestamps, and out-of-order segments get a duplicate ACK so the peer
-/// retransmits.
+/// Deliberately minimal, like the Dart reference: no SACK, no timestamps, and
+/// out-of-order segments get a duplicate ACK so the peer retransmits. Window
+/// scaling is negotiable (`Configuration.windowScale`) because the 64 KB the
+/// bare header field holds caps a connection's throughput.
 public final class ATrustTcpTerminator {
   public struct Configuration {
     public var maximumSegmentSize = 1400
-    public var advertisedWindow = 65535
+    /// Receive window advertised to the local stack: it bounds how many bytes
+    /// of a terminated connection may be in flight towards the local stack at
+    /// once, which is how fast that connection can drain. Above 65535 it needs
+    /// `windowScale`, because the bare header field cannot hold more; a peer
+    /// that does not offer scaling falls back to the 64 KB field the RFC allows
+    /// there.
+    public var advertisedWindow = 1024 * 1024
+    /// Window scale shift offered in the SYN-ACK (RFC 7323).
+    ///
+    /// Scaling only takes effect when the peer offered the option too, so
+    /// sending it is free: without the peer's option the connection uses the
+    /// bare 16-bit field exactly as before. It is on by default because 64 KB
+    /// is all a terminated connection can keep in flight otherwise, which caps
+    /// its throughput at `64 KB / round trip` -- and this round trip runs
+    /// through the host's own event loop, so it stretches out exactly when the
+    /// host is busy.
+    public var windowScale = 7
     public var dialTimeout: Double = 20
     public var idleTimeout: Double = 300
     public var initialRetransmitTimeout: Double = 0.3
@@ -217,6 +234,8 @@ final class TerminatedConnection {
   private var sendNext = 0
   private var sendUnacknowledged = 0
   private var peerWindow = 0
+  private var peerWindowScale = 0
+  private var scaling = false
   private var maximumSegmentSize = 1400
   private var handshakeComplete = false
   private var upstreamDone = false
@@ -265,7 +284,16 @@ final class TerminatedConnection {
     ourInitialSequence = terminator.nextInitialSequence()
     sendNext = tcpSequenceAdd(ourInitialSequence, 1)
     sendUnacknowledged = ourInitialSequence
+    // RFC 7323: the window field of the SYN itself is never scaled, so this is
+    // the peer's real byte count.
     peerWindow = tcp.window
+    if configuration.windowScale > 0,
+      let peerScale = tcp.windowScale,
+      peerScale <= ATrustTcpOption.maximumWindowScale
+    {
+      scaling = true
+      peerWindowScale = peerScale
+    }
     let offered = tcp.maximumSegmentSize
     maximumSegmentSize = offered == 0
       ? terminator.configuration.maximumSegmentSize
@@ -292,7 +320,7 @@ final class TerminatedConnection {
       dispose(reset: false)
       return
     }
-    peerWindow = tcp.window
+    peerWindow = scaledPeerWindow(tcp)
     if tcp.flags & ATrustTcpFlag.ack != 0 {
       acknowledge(tcp.acknowledgmentNumber)
     }
@@ -444,6 +472,31 @@ final class TerminatedConnection {
     )
   }
 
+  /// The window field for a segment that is not a SYN. With scaling negotiated
+  /// it carries the scaled value, which is what lets the peer keep megabytes in
+  /// flight.
+  private var windowField: Int {
+    scaling
+      ? configuration.advertisedWindow >> configuration.windowScale
+      : unscaledWindow
+  }
+
+  /// The window field as it appears before scaling is agreed to. RFC 7323
+  /// leaves the SYN's and SYN-ACK's own field unscaled, and the 16-bit field
+  /// cannot hold more than this anyway.
+  private var unscaledWindow: Int {
+    min(configuration.advertisedWindow, 0xffff)
+  }
+
+  /// The peer's window field brought back to bytes. Scaling applies only to
+  /// segments after the SYN, whose field is always literal.
+  private func scaledPeerWindow(_ tcp: ATrustTcpSegmentHeader) -> Int {
+    if scaling, tcp.flags & ATrustTcpFlag.syn == 0 {
+      return tcp.window << peerWindowScale
+    }
+    return tcp.window
+  }
+
   private func transmit(
     flags: UInt8,
     payload: [UInt8] = [],
@@ -479,6 +532,7 @@ final class TerminatedConnection {
     mss: Int?,
     sequenceOverride: Int? = nil
   ) -> Data {
+    let isSyn = flags & ATrustTcpFlag.syn != 0
     let packet = (try? ATrustPacketCodec.buildTcp(
       sourceAddress: serverAddress,
       destinationAddress: clientAddress,
@@ -487,9 +541,10 @@ final class TerminatedConnection {
       sequenceNumber: sequenceOverride ?? sendNext,
       acknowledgmentNumber: receiveNext,
       flags: flags,
-      window: configuration.advertisedWindow,
+      window: isSyn ? unscaledWindow : windowField,
       payload: payload,
       mss: mss,
+      windowScale: isSyn && scaling ? configuration.windowScale : nil,
       identification: terminator?.nextIdentification() ?? 0
     )) ?? Data()
     return packet
